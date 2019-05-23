@@ -73,5 +73,5 @@ jobs:
         displayName: 'Upload nightly'
       - task: PublishPipelineArtifact@0
         inputs:
-          artifactName: 'artifactName'
+          artifactName: "MM2-$(Agent.OS)"
           targetPath: 'upload'
