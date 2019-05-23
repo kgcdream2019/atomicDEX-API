@@ -70,3 +70,7 @@ jobs:
           targetFolder: "uploads/$(Build.SourceBranchName)" # Optional
           overwrite: true
         displayName: 'Upload nightly'
+      - task: PublishPipelineArtifact@0
+        inputs:
+          artifactName: 'artifactName'
+          targetPath: 'upload'
