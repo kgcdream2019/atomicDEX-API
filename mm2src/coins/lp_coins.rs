@@ -29,6 +29,7 @@
 #[macro_use] extern crate serde_json;
 #[macro_use] extern crate unwrap;
 
+use bigdecimal::BigDecimal;
 use common::{bitcoin_ctx, lp, rpc_response, rpc_err_response, HyRes};
 use common::mm_ctx::{from_ctx, MmArc};
 use dirs::home_dir;
@@ -54,6 +55,7 @@ pub mod eth;
 use self::eth::{eth_coin_from_iguana_info, EthCoin, SignedEthTx};
 pub mod utxo;
 use self::utxo::{utxo_coin_from_iguana_info, UtxoTx, UtxoCoin, UtxoInitMode};
+use crate::utxo::rpc_clients::ElectrumRpcRequest;
 
 pub trait Transaction: Debug + 'static {
     /// Raw transaction bytes of the transaction
@@ -81,7 +83,7 @@ ifrom! (TransactionEnum, SignedEthTx);
 
 // NB: When stable and groked by IDEs, `enum_dispatch` can be used instead of `Deref` to speed things up.
 impl Deref for TransactionEnum {
-    type Target = Transaction;
+    type Target = dyn Transaction;
     fn deref (&self) -> &dyn Transaction {
         match self {
             &TransactionEnum::UtxoTx (ref t) => t,
@@ -92,14 +94,14 @@ pub type TransactionFut = Box<dyn Future<Item=TransactionEnum, Error=String>>;
 
 /// Swap operations (mostly based on the Hash/Time locked transactions implemented by coin wallets).
 pub trait SwapOps {
-    fn send_taker_fee(&self, fee_addr: &[u8], amount: u64) -> TransactionFut;
+    fn send_taker_fee(&self, fee_addr: &[u8], amount: BigDecimal) -> TransactionFut;
 
     fn send_maker_payment(
         &self,
         time_lock: u32,
         taker_pub: &[u8],
         secret_hash: &[u8],
-        amount: u64
+        amount: BigDecimal,
     ) -> TransactionFut;
 
     fn send_taker_payment(
@@ -107,7 +109,7 @@ pub trait SwapOps {
         time_lock: u32,
         maker_pub: &[u8],
         secret_hash: &[u8],
-        amount: u64,
+        amount: BigDecimal,
     ) -> TransactionFut;
 
     fn send_maker_spends_taker_payment(
@@ -144,9 +146,9 @@ pub trait SwapOps {
 
     fn validate_fee(
         &self,
-        fee_tx: TransactionEnum,
+        fee_tx: &TransactionEnum,
         fee_addr: &[u8],
-        amount: u64
+        amount: &BigDecimal,
     ) -> Result<(), String>;
 
     fn validate_maker_payment(
@@ -155,7 +157,7 @@ pub trait SwapOps {
         time_lock: u32,
         maker_pub: &[u8],
         priv_bn_hash: &[u8],
-        amount: u64,
+        amount: BigDecimal,
     ) -> Result<(), String>;
 
     fn validate_taker_payment(
@@ -164,8 +166,16 @@ pub trait SwapOps {
         time_lock: u32,
         taker_pub: &[u8],
         priv_bn_hash: &[u8],
-        amount: u64,
+        amount: BigDecimal,
     ) -> Result<(), String>;
+
+    fn check_if_my_payment_sent(
+        &self,
+        time_lock: u32,
+        other_pub: &[u8],
+        secret_hash: &[u8],
+        search_from_block: u64,
+    ) -> Result<Option<TransactionEnum>, String>;
 }
 
 /// Operations that coins have independently from the MarketMaker.
@@ -173,10 +183,10 @@ pub trait SwapOps {
 pub trait MarketCoinOps {
     fn my_address(&self) -> Cow<str>;
 
-    fn my_balance(&self) -> Box<Future<Item=f64, Error=String> + Send>;
+    fn my_balance(&self) -> Box<dyn Future<Item=BigDecimal, Error=String> + Send>;
 
     /// Receives raw transaction bytes in hexadecimal format as input and returns tx hash in hexadecimal format
-    fn send_raw_tx(&self, tx: &str) -> Box<Future<Item=String, Error=String> + Send>;
+    fn send_raw_tx(&self, tx: &str) -> Box<dyn Future<Item=String, Error=String> + Send>;
 
     fn wait_for_confirmations(
         &self,
@@ -185,11 +195,11 @@ pub trait MarketCoinOps {
         wait_until: u64,
     ) -> Result<(), String>;
 
-    fn wait_for_tx_spend(&self, transaction: &[u8], wait_until: u64) -> Result<TransactionEnum, String>;
+    fn wait_for_tx_spend(&self, transaction: &[u8], wait_until: u64, from_block: u64) -> Result<TransactionEnum, String>;
 
     fn tx_enum_from_bytes(&self, bytes: &[u8]) -> Result<TransactionEnum, String>;
 
-    fn current_block(&self) -> Box<Future<Item=u64, Error=String> + Send>;
+    fn current_block(&self) -> Box<dyn Future<Item=u64, Error=String> + Send>;
 }
 
 /// Compatibility layer on top of `lp::iguana_info`.  
@@ -211,13 +221,13 @@ struct WithdrawRequest {
     coin: String,
     to: String,
     #[serde(default)]
-    amount: f64,
+    amount: BigDecimal,
     #[serde(default)]
     max: bool
 }
 
 /// Transaction details
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct TransactionDetails {
     /// Raw bytes of signed transaction in hexadecimal string, this should be sent as is to send_raw_transaction RPC to broadcast the transaction
     pub tx_hex: BytesJson,
@@ -260,11 +270,11 @@ pub trait MmCoin: SwapOps + MarketCoinOps + IguanaInfo + Debug + 'static {
 
     fn is_asset_chain(&self) -> bool;
 
-    fn check_i_have_enough_to_trade(&self, amount: f64, maker: bool) -> Box<Future<Item=(), Error=String> + Send>;
+    fn check_i_have_enough_to_trade(&self, amount: &BigDecimal, balance: &BigDecimal, maker: bool) -> Box<dyn Future<Item=(), Error=String> + Send>;
 
-    fn can_i_spend_other_payment(&self) -> Box<Future<Item=(), Error=String> + Send>;
+    fn can_i_spend_other_payment(&self) -> Box<dyn Future<Item=(), Error=String> + Send>;
 
-    fn withdraw(&self, to: &str, amount: f64, max: bool) -> Box<Future<Item=TransactionDetails, Error=String> + Send>;
+    fn withdraw(&self, to: &str, amount: BigDecimal, max: bool) -> Box<dyn Future<Item=TransactionDetails, Error=String> + Send>;
 
     /// Maximum number of digits after decimal point used to denominate integer coin units (satoshis, wei, etc.)
     fn decimals(&self) -> u8;
@@ -304,6 +314,12 @@ pub trait MmCoin: SwapOps + MarketCoinOps + IguanaInfo + Debug + 'static {
 
     /// Gets tx details by hash requesting the coin RPC if required
     fn tx_details_by_hash(&self, hash: &[u8]) -> Result<TransactionDetails, String>;
+
+    /// Transaction history background sync status
+    fn history_sync_status(&self) -> HistorySyncState;
+
+    /// Get fee to be paid per 1 swap transaction
+    fn get_trade_fee(&self) -> HyRes;
 }
 
 #[derive(Clone, Debug)]
@@ -324,7 +340,7 @@ impl From<EthCoin> for MmCoinEnum {
 
 // NB: When stable and groked by IDEs, `enum_dispatch` can be used instead of `Deref` to speed things up.
 impl Deref for MmCoinEnum {
-    type Target = MmCoin;
+    type Target = dyn MmCoin;
     fn deref (&self) -> &dyn MmCoin {
         match self {
             &MmCoinEnum::UtxoCoin (ref c) => c,
@@ -698,7 +714,7 @@ fn lp_coininit (ctx: &MmArc, ticker: &str, req: &Json) -> Result<MmCoinEnum, Str
     ii.wiftaddr = 0;
     ii.longestchain = 1;
     ii.txfee = match coins_en["txfee"].as_u64() {
-        None | Some (0) => if ticker == "BTC" {0} else {lp::LP_MIN_TXFEE as u64},
+        None | Some (0) => if ticker == "BTC" || ticker == "QTUM" {0} else {lp::LP_MIN_TXFEE as u64},
         Some (fee) => fee
     };
     ii.pubtype = coins_en["pubtype"].as_u64().unwrap_or (if ticker == "BTC" {0} else {60}) as u8;
@@ -781,35 +797,6 @@ fn lp_coininit (ctx: &MmArc, ticker: &str, req: &Json) -> Result<MmCoinEnum, Str
         try_s! (safecopy! (ii.etomic, "{}", etomic));
     }
 
-    let electrum_urls: Vec<String> = loop {
-        // See if the Electrum servers are explicitly defined in the request.
-        if let Some (urls) = req["urls"].as_array() {
-            if !urls.is_empty() {
-                break try_s! (urls.iter()
-                    .map (|j| j.as_str().map (|s| s.to_string()) .ok_or ("electrum/urls member is not a string"))
-                    .collect())
-        }   }
-
-        // Check the coin configuration for the list of Electrum servers.
-        // Example: https://github.com/atomiclabs/hyperdex/blob/1d4ed3234b482e769124725c7e979eef5cd72d24/app/marketmaker/supported-currencies.js#L20
-        if let Some (servers) = coins_en["electrumServers"].as_array() {
-            let mut urls = Vec::with_capacity (servers.len());
-            for server in servers {
-                let host = match server["host"].as_str() {
-                    Some (host) => host,
-                    None => return ERR! ("Found no string `host` field in `electrumServers` of coin {}", ticker)
-                };
-                let port = match server["port"].as_u64() {
-                    Some (port) => port,
-                    None => return ERR! ("Found no unsigned `port` field in `electrumServers` of coin {}", ticker)
-                };
-                urls.push (fomat! ((host) ':' (port)))
-            }
-            break urls
-        }
-        break Vec::new()
-    };
-
     let method: &str = loop {
         // See if the method was explicitly picked (by an RPC call).
         if let Some (method) = req["method"].as_str() {break method}
@@ -817,13 +804,11 @@ fn lp_coininit (ctx: &MmArc, ticker: &str, req: &Json) -> Result<MmCoinEnum, Str
         // Enable in the "native" mode if the port of the local wallet is configured and electrum is not.
         if coins_en["rpcport"].as_u64().is_some() && coins_en["electrumServers"].as_array().is_none() {break "enable"}
 
-        // Enable in the "electrum" mode if we know of a list of electrum servers for that coin, default or otherwise.
-        if !electrum_urls.is_empty() {break "electrum"}
-
         return ERR! ("lp_coininit ({}): no method", ticker);
     };
     let utxo_mode = if method == "electrum" {
-        UtxoInitMode::Electrum (electrum_urls)
+        let servers: Vec<ElectrumRpcRequest> = try_s!(json::from_value(req["servers"].clone()));
+        UtxoInitMode::Electrum (servers)
     } else if method == "enable" {
         if unsafe {!lp::LP_conflicts_find (ii) .is_null()} {return ERR! ("coin port conflicts with existing coin")}
         UtxoInitMode::Native
@@ -832,7 +817,7 @@ fn lp_coininit (ctx: &MmArc, ticker: &str, req: &Json) -> Result<MmCoinEnum, Str
     };
 
     let coin: MmCoinEnum = if coins_en["etomic"].is_null() {
-        try_s! (utxo_coin_from_iguana_info (ii, utxo_mode, rpc_port)) .into()
+        try_s! (utxo_coin_from_iguana_info (ii, utxo_mode, rpc_port, req)) .into()
     } else {
         try_s! (eth_coin_from_iguana_info(ii, req)) .into()
     };
@@ -967,60 +952,95 @@ pub fn send_raw_transaction (ctx: MmArc, req: Json) -> HyRes {
     }))
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "state", content = "additional_info")]
+pub enum HistorySyncState {
+    NotEnabled,
+    NotStarted,
+    InProgress(Json),
+    Error(Json),
+    Finished,
+}
+
 /// Returns the transaction history of selected coin. Returns no more than `limit` records (default: 10).
 /// Skips the first `skip` records (default: 0).
 /// Transactions are sorted by number of confirmations in ascending order.
 pub fn my_tx_history(ctx: MmArc, req: Json) -> HyRes {
-    let ticker = try_h! (req["coin"].as_str().ok_or ("No 'coin' field")).to_owned();
-    let coin = match lp_coinfind (&ctx, &ticker) {
-        Ok (Some (t)) => t,
-        Ok (None) => return rpc_err_response (500, &fomat! ("No such coin: " (ticker))),
-        Err (err) => return rpc_err_response (500, &fomat! ("!lp_coinfind(" (ticker) "): " (err)))
+    let ticker = try_h!(req["coin"].as_str().ok_or ("No 'coin' field")).to_owned();
+    let coin = match lp_coinfind(&ctx, &ticker) {
+        Ok(Some(t)) => t,
+        Ok(None) => return rpc_err_response(500, &fomat!("No such coin: " (ticker))),
+        Err(err) => return rpc_err_response(500, &fomat!("!lp_coinfind(" (ticker) "): " (err)))
     };
     let limit = req["limit"].as_u64().unwrap_or(10);
     let from_id: Option<BytesJson> = try_h!(json::from_value(req["from_id"].clone()));
     let file_path = coin.tx_history_path(&ctx);
     let content = slurp(&file_path);
-    if content.is_empty() {
+    let history: Vec<TransactionDetails> = match json::from_slice(&content) {
+        Ok(h) => h,
+        Err(e) => {
+            if !content.is_empty() {
+                log!("Error " (e) " on attempt to deserialize file " (file_path.display()) " content as Vec<TransactionDetails>");
+            }
+            vec![]
+        }
+    };
+    let total_records = history.len();
+    Box::new(coin.current_block().and_then(move |block_number| {
+        let skip = match &from_id {
+            Some(id) => {
+                try_h!(history.iter().position(|item| item.internal_id == *id).ok_or(format!("from_id {:02x} is not found", id))) + 1
+            },
+            None => 0,
+        };
+        let history = history.into_iter().skip(skip).take(limit as usize);
+        let history: Vec<Json> = history.map(|item| {
+            let tx_block = item.block_height;
+            let mut json = unwrap!(json::to_value(item));
+            json["confirmations"] = if tx_block == 0 {
+                Json::from(0)
+            } else {
+                Json::from(block_number - tx_block + 1)
+            };
+            json
+        }).collect();
         rpc_response(200, json!({
             "result": {
-                "transactions": [],
+                "transactions": history,
                 "limit": limit,
-                "skipped": 0,
+                "skipped": skip,
                 "from_id": from_id,
-                "total": 0,
+                "total": total_records,
+                "current_block": block_number,
+                "sync_status": coin.history_sync_status(),
             }
         }).to_string())
-    } else {
-        let history: Vec<TransactionDetails> = try_h!(json::from_slice(&content));
-        let total_records = history.len();
-        Box::new(coin.current_block().and_then(move |block_number| {
-            let skip = match &from_id {
-                Some(id) => {
-                    try_h!(history.iter().position(|item| item.internal_id == *id).ok_or(format!("from_id {:02x} is not found", id))) + 1
-                },
-                None => 0,
-            };
-            let history = history.into_iter().skip(skip).take(limit as usize);
-            let history: Vec<Json> = history.map(|item| {
-                let tx_block = item.block_height;
-                let mut json = unwrap!(json::to_value(item));
-                json["confirmations"] = if tx_block == 0 {
-                    Json::from(0)
-                } else {
-                    Json::from(block_number - tx_block + 1)
-                };
-                json
-            }).collect();
-            rpc_response(200, json!({
-                "result": {
-                    "transactions": history,
-                    "limit": limit,
-                    "skipped": skip,
-                    "from_id": from_id,
-                    "total": total_records,
-                }
-            }).to_string())
-        }))
-    }
+    }))
+}
+
+pub fn get_trade_fee(ctx: MmArc, req: Json) -> HyRes {
+    let ticker = try_h!(req["coin"].as_str().ok_or ("No 'coin' field")).to_owned();
+    let coin = match lp_coinfind(&ctx, &ticker) {
+        Ok(Some(t)) => t,
+        Ok(None) => return rpc_err_response(500, &fomat!("No such coin: " (ticker))),
+        Err(err) => return rpc_err_response(500, &fomat!("!lp_coinfind(" (ticker) "): " (err)))
+    };
+    coin.get_trade_fee()
+}
+
+#[derive(Serialize)]
+struct EnabledCoin {
+    ticker: String,
+    address: String,
+}
+
+pub fn get_enabled_coins(ctx: MmArc) -> HyRes {
+    let coins_ctx: Arc<CoinsContext> = try_h!(CoinsContext::from_ctx(&ctx));
+    let enabled_coins: Vec<_> = try_h!(coins_ctx.coins.lock()).iter().map(|(ticker, coin)| EnabledCoin {
+        ticker: ticker.clone(),
+        address: coin.my_address().to_string(),
+    }).collect();
+    rpc_response(200, json!({
+        "result": enabled_coins
+    }).to_string())
 }

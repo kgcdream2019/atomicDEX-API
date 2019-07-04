@@ -1,14 +1,16 @@
 use crossbeam::{channel, Sender, Receiver};
+use hashbrown::HashSet;
 use hashbrown::hash_map::{Entry, HashMap};
+use keys::KeyPair;
 use libc::{c_void};
 use primitives::hash::H160;
 use rand::random;
-use serde_json::{Value as Json};
+use serde_json::{self as json, Value as Json};
 use std::any::Any;
 use std::net::{IpAddr, SocketAddr};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::ptr::{null_mut};
+use std::ptr::{null_mut, read_volatile};
 use std::sync::{Arc, Mutex, Weak};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use super::{bitcoin_ctx, bitcoin_ctx_destroy, lp, log, BitcoinCtx};
@@ -53,33 +55,41 @@ pub struct MmCtx {
     /// 0 if the handler ID is allocated yet.
     ffi_handle: AtomicU32,
     /// Callbacks to invoke from `fn stop`.
-    stop_listeners: Mutex<Vec<Box<FnMut()->Result<(), String>>>>,
+    stop_listeners: Mutex<Vec<Box<dyn FnMut()->Result<(), String>>>>,
     /// The context belonging to the `portfolio` crate: `PortfolioContext`.
-    pub portfolio_ctx: Mutex<Option<Arc<Any + 'static + Send + Sync>>>,
+    pub portfolio_ctx: Mutex<Option<Arc<dyn Any + 'static + Send + Sync>>>,
     /// The context belonging to the `ordermatch` mod: `OrdermatchContext`.
-    pub ordermatch_ctx: Mutex<Option<Arc<Any + 'static + Send + Sync>>>,
+    pub ordermatch_ctx: Mutex<Option<Arc<dyn Any + 'static + Send + Sync>>>,
     /// The context belonging to the `peers` crate: `PeersContext`.
-    pub peers_ctx: Mutex<Option<Arc<Any + 'static + Send + Sync>>>,
+    pub peers_ctx: Mutex<Option<Arc<dyn Any + 'static + Send + Sync>>>,
     /// The context belonging to the `http_fallback` mod: `HttpFallbackContext`.
-    pub http_fallback_ctx: Mutex<Option<Arc<Any + 'static + Send + Sync>>>,
+    pub http_fallback_ctx: Mutex<Option<Arc<dyn Any + 'static + Send + Sync>>>,
     /// The context belonging to the `coins` crate: `CoinsContext`.
-    pub coins_ctx: Mutex<Option<Arc<Any + 'static + Send + Sync>>>,
+    pub coins_ctx: Mutex<Option<Arc<dyn Any + 'static + Send + Sync>>>,
     /// The context belonging to the `prices` mod: `PricesContext`.
-    pub prices_ctx: Mutex<Option<Arc<Any + 'static + Send + Sync>>>,
+    pub prices_ctx: Mutex<Option<Arc<dyn Any + 'static + Send + Sync>>>,
     /// Seednode P2P message bus channel
     pub seednode_p2p_channel: (Sender<Vec<u8>>, Receiver<Vec<u8>>),
     /// Standard node P2P message bus channel
     pub client_p2p_channel: (Sender<Vec<u8>>, Receiver<Vec<u8>>),
     /// RIPEMD160(SHA256(x)) where x is secp256k1 pubkey derived from passphrase
-    /// The replacement of lp::G.LP_myrmd160
-    pub rmd160: H160
+    /// The future replacement of lp::G.LP_myrmd160
+    pub rmd160: H160,
+    /// Seed node IPs, initialized in `fn lp_initpeers`.
+    pub seeds: Mutex<Vec<IpAddr>>,
+    /// secp256k1 key pair derived from passphrase
+    /// future replacement of lp::G.LP_privkey
+    pub secp256k1_key_pair: Option<KeyPair>,
+    /// Coins that should be enabled to kick start the interrupted swaps and orders
+    pub coins_needed_for_kick_start: Mutex<HashSet<String>>,
+    /// The context belonging to the `lp_swap` mod: `SwapsContext`.
+    pub swaps_ctx: Mutex<Option<Arc<dyn Any + 'static + Send + Sync>>>,
 }
 impl MmCtx {
-    pub fn new (conf: Json, rmd160: H160) -> MmArc {
-        let log = log::LogState::mm (&conf);
-        MmArc (Arc::new (MmCtx {
-            conf,
-            log,
+    pub fn new () -> MmCtx {
+        MmCtx {
+            conf: Json::Object (json::Map::new()),
+            log: log::LogState::in_memory(),
             btc_ctx: unsafe {bitcoin_ctx()},
             initialized: AtomicBool::new (false),
             rpc_started: AtomicBool::new (false),
@@ -94,8 +104,12 @@ impl MmCtx {
             prices_ctx: Mutex::new (None),
             seednode_p2p_channel: channel::unbounded(),
             client_p2p_channel: channel::unbounded(),
-            rmd160,
-        }))
+            rmd160: [0; 20].into(),
+            seeds: Mutex::new (Vec::new()),
+            secp256k1_key_pair: None,
+            coins_needed_for_kick_start: Mutex::new(HashSet::new()),
+            swaps_ctx: Mutex::new (None),
+        }
     }
 
     /// This field is freed when `MmCtx` is dropped, make sure `MmCtx` stays around while it's used.
@@ -159,13 +173,13 @@ impl MmCtx {
 
     /// True if the MarketMaker instance needs to stop.
     pub fn is_stopping (&self) -> bool {
-        if unsafe {lp::LP_STOP_RECEIVED != 0} {return true}
+        if unsafe {read_volatile (&lp::LP_STOP_RECEIVED) != 0} {return true}
         self.stop.load (Ordering::Relaxed)
     }
 
     /// Register a callback to be invoked when the MM receives the "stop" request.  
     /// The callback is invoked immediately if the MM is stopped already.
-    pub fn on_stop (&self, mut cb: Box<FnMut()->Result<(), String>>) {
+    pub fn on_stop (&self, mut cb: Box<dyn FnMut()->Result<(), String>>) {
         let mut stop_listeners = unwrap! (self.stop_listeners.lock(), "Can't lock stop_listeners");
         if self.stop.load (Ordering::Relaxed) {
             if let Err (err) = cb() {
@@ -184,6 +198,11 @@ impl MmCtx {
         } else {
             unwrap!(self.client_p2p_channel.0.send(msg.to_owned().into_bytes()));
         }
+    }
+
+    /// Get the reference to secp256k1 key pair
+    pub fn secp256k1_key_pair(&self) -> &KeyPair {
+        unwrap!(self.secp256k1_key_pair.as_ref())
     }
 }
 impl Drop for MmCtx {
@@ -279,7 +298,7 @@ pub fn r_btc_ctx (mm_ctx_id: u32) -> *mut c_void {
 /// 
 /// * `ctx_field` - A dedicated crate context field in `MmCtx`, such as the `MmCtx::portfolio_ctx`.
 /// * `constructor` - Generates the initial crate context.
-pub fn from_ctx<T, C> (ctx_field: &Mutex<Option<Arc<Any + 'static + Send + Sync>>>, constructor: C) -> Result<Arc<T>, String>
+pub fn from_ctx<T, C> (ctx_field: &Mutex<Option<Arc<dyn Any + 'static + Send + Sync>>>, constructor: C) -> Result<Arc<T>, String>
 where C: FnOnce()->Result<T, String>, T: 'static + Send + Sync {
     let mut ctx_field = try_s! (ctx_field.lock());
     if let Some (ref ctx) = *ctx_field {
@@ -292,4 +311,32 @@ where C: FnOnce()->Result<T, String>, T: 'static + Send + Sync {
     let arc = Arc::new (try_s! (constructor()));
     *ctx_field = Some (arc.clone());
     return Ok (arc)
+}
+
+pub struct MmCtxBuilder {
+    ctx: MmCtx,
+}
+
+impl MmCtxBuilder {
+    pub fn new() -> Self {
+        MmCtxBuilder {
+            ctx: MmCtx::new(),
+        }
+    }
+
+    pub fn with_conf(mut self, conf: Json) -> Self {
+        self.ctx.log = log::LogState::mm(&conf);
+        self.ctx.conf = conf;
+        self
+    }
+
+    pub fn with_secp256k1_key_pair(mut self, key_pair: KeyPair) -> Self {
+        self.ctx.rmd160 = key_pair.public().address_hash();
+        self.ctx.secp256k1_key_pair = Some(key_pair);
+        self
+    }
+
+    pub fn into_mm_arc(self) -> MmArc {
+        MmArc(Arc::new(self.ctx))
+    }
 }

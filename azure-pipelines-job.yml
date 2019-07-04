@@ -38,7 +38,7 @@ jobs:
           rm -rf upload
           mkdir upload
           touch mm2src/common/build.rs
-          cargo build -vv
+          cargo build --features native -vv
         displayName: 'Build MM2'
       # Cargo uses CPU threads count by default running only 2 concurrent tests on Linux.
       # Explicit --test-threads=8 makes the process faster

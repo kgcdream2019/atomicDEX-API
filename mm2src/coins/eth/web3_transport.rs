@@ -1,8 +1,9 @@
-use common::{slurp_req, StringError};
+use common::StringError;
+use common::wio::slurp_req;
 use common::custom_futures::select_ok_sequential;
 use futures::Future;
 use futures_timer::{FutureExt};
-use hyper::header::HeaderValue;
+use http::header::HeaderValue;
 use jsonrpc_core::{Call, Response};
 use serde_json::{Value as Json};
 use std::ops::Deref;
@@ -16,7 +17,7 @@ use web3::helpers::{build_request, to_result_from_output, to_string};
 /// Parse bytes RPC response into `Result`.
 /// Implementation copied from Web3 HTTP transport
 fn single_response<T: Deref<Target = [u8]>>(response: T) -> Result<Json, Error> {
-    let response = serde_json::from_slice(&*response).map_err(|e| Error::from(ErrorKind::InvalidResponse(format!("{:?}", e))))?;
+    let response = serde_json::from_slice(&*response).map_err(|e| Error::from(ErrorKind::InvalidResponse(format!("{}", e))))?;
 
     match response {
         Response::Single(output) => to_result_from_output(output),
@@ -27,7 +28,7 @@ fn single_response<T: Deref<Target = [u8]>>(response: T) -> Result<Json, Error> 
 #[derive(Debug, Clone)]
 pub struct Web3Transport {
     id: Arc<AtomicUsize>,
-    uris: Vec<hyper::Uri>,
+    uris: Vec<http::Uri>,
 }
 
 impl Web3Transport {
@@ -44,7 +45,7 @@ impl Web3Transport {
 }
 
 impl Transport for Web3Transport {
-    type Out = Box<Future<Item=Json, Error=Error> + Send>;
+    type Out = Box<dyn Future<Item=Json, Error=Error> + Send>;
 
     fn prepare(&self, method: &str, params: Vec<Json>) -> (RequestId, Call) {
         let id = self.id.fetch_add(1, Ordering::AcqRel);
@@ -57,14 +58,17 @@ impl Transport for Web3Transport {
         let mut futures = vec![];
         for uri in self.uris.iter() {
             let request = to_string(&request);
-            let mut req = hyper::Request::new(hyper::Body::from(request));
-            *req.method_mut() = hyper::Method::POST;
+            let mut req = http::Request::new(Vec::from(request.clone()));
+            *req.method_mut() = http::Method::POST;
             *req.uri_mut() = uri.clone();
-            req.headers_mut().insert(hyper::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            req.headers_mut().insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
             let fut = slurp_req(req)
                 .map_err(|e| StringError(e))
                 .timeout(Duration::from_secs(60))
-                .map_err(|e| ERRL!("{}", e.0));
+                .map_err(move |e| {
+                    log!("Error " (e.0) " on request " (request));
+                    ERRL!("{}", e.0)
+                });
             futures.push(fut);
         }
 

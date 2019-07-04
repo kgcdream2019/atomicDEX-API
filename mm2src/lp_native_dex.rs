@@ -22,9 +22,9 @@ use futures::{Future};
 use futures::sync::oneshot::Sender;
 use gstuff::now_ms;
 use hex;
-use hyper::StatusCode;
+use http::StatusCode;
+use keys::KeyPair;
 use libc::{self, c_char, c_void};
-use primitives::hash::H160;
 use rand::{random, Rng, SeedableRng};
 use rand::rngs::SmallRng;
 use serde_json::{self as json, Value as Json};
@@ -47,13 +47,15 @@ use peers::http_fallback::new_http_fallback;
 use portfolio::prices_loop;
 
 use crate::common::{
-    bits256, coins_iter, lp, lp_queue_command_for_c, os, slurp_url,
-    CORE, CJSON, MM_VERSION};
+    bits256, coins_iter, lp, lp_queue_command_for_c, os, CJSON, MM_VERSION};
+use crate::common::wio::{slurp_url, CORE};
 use crate::common::log::TagParam;
 use crate::common::mm_ctx::{MmCtx, MmArc};
 use crate::mm2::lp_network::{lp_command_q_loop, seednode_loop, client_p2p_loop};
-use crate::mm2::lp_ordermatch::{lp_trade_command, lp_trades_loop};
+use crate::mm2::lp_ordermatch::{lp_trade_command, lp_trades_loop, orders_kick_start};
+use crate::mm2::lp_swap::swap_kick_starts;
 use crate::mm2::rpc::{self, SINGLE_THREADED_C_LOCK};
+use common::mm_ctx::MmCtxBuilder;
 
 /*
 #include <stdio.h>
@@ -128,8 +130,6 @@ struct LP_peerinfo  *LP_peerinfos,*LP_mypeer;
 struct LP_forwardinfo *LP_forwardinfos;
 struct iguana_info *LP_coins;
 struct LP_pubkey_info *LP_pubkeyinfos;
-struct rpcrequest_info *LP_garbage_collector;
-struct LP_address_utxo *LP_garbage_collector2;
 struct LP_trade *LP_trades,*LP_tradesQ;
 
 //uint32_t LP_deadman_switch;
@@ -245,7 +245,7 @@ pub unsafe fn lp_command_process(
         let _lock = SINGLE_THREADED_C_LOCK.lock();
         let mut trade_command = -1;
         if stats_json_only == 0 {
-            trade_command = lp_trade_command(ctx.clone(), json, &c_json);
+            trade_command = lp_trade_command(ctx.clone(), json);
         }
         if trade_command <= 0 {
             lp::stats_JSON(
@@ -990,7 +990,7 @@ pub unsafe fn lp_initpeers (ctx: &MmArc, pubsock: i32, mut mypeer: *mut lp::LP_p
     {
         let mut status = ctx.log.status_handle();
         while lp::G.waiting == 0 {
-            status.status (&[&"lp_init_peers"], "Waiting for `G.waiting`...");
+            status.status (&[&"lp_init_peers"], "Waiting for `G.waiting`…");
             sleep (Duration::from_millis (100))
         }
         status.append (" Done.");
@@ -1000,7 +1000,6 @@ pub unsafe fn lp_initpeers (ctx: &MmArc, pubsock: i32, mut mypeer: *mut lp::LP_p
     let (mut pullport, mut pubport, mut busport) = (0, 0, 0);
     lp::LP_ports (&mut pullport, &mut pubport, &mut busport, netid);
     // Add ourselves into the list of known peers.
-    try_s! (peers::initialize (ctx, netid, lp::G.LP_mypub25519, pubport + 1, lp::G.LP_sessionid));
     let myipaddr_c = try_s! (CString::new (fomat! ((myipaddr))));
     mypeer = lp::LP_addpeer (mypeer, pubsock, myipaddr_c.as_ptr() as *mut c_char, myport, pullport, pubport, 1, lp::G.LP_sessionid, netid);
     lp::LP_mypeer = mypeer;
@@ -1046,10 +1045,16 @@ pub unsafe fn lp_initpeers (ctx: &MmArc, pubsock: i32, mut mypeer: *mut lp::LP_p
         }));
     }
 
+    let mut seed_ips = Vec::with_capacity (seeds.len());
     for (seed_ip, is_lp) in seeds {
+        seed_ips.push (try_s! (seed_ip.parse()));
         let ip = try_s! (CString::new (&seed_ip[..]));
         lp::LP_addpeer (mypeer, pubsock, ip.as_ptr() as *mut c_char, myport, pullport, pubport, if is_lp {1} else {0}, lp::G.LP_sessionid, netid);
     }
+    *try_s! (ctx.seeds.lock()) = seed_ips;
+
+    try_s! (peers::initialize (ctx, netid, lp::G.LP_mypub25519.bytes, pubport + 1));
+
     Ok(())
 }
 
@@ -1085,289 +1090,6 @@ struct LP_pendswap
     struct LP_pendswap *next,*prev;
     uint32_t expiration,requestid,quoteid,finished;
 };
-
-struct LP_pendswap *LP_pendingswaps;
-
-void LP_pendswap_add(uint32_t expiration,uint32_t requestid,uint32_t quoteid)
-{
-    struct LP_pendswap *sp;
-    printf("LP_pendswap_add expiration.%u %u-%u\n",expiration,requestid,quoteid);
-    portable_mutex_lock(&LP_pendswap_mutex);
-    sp = calloc(1,sizeof(*sp));
-    sp->expiration = expiration;
-    sp->requestid = requestid;
-    sp->quoteid = quoteid;
-    DL_APPEND(LP_pendingswaps,sp);
-    portable_mutex_unlock(&LP_pendswap_mutex);
-}
-
-void LP_swapsloop(void *ctx)
-{
-    char *retstr; cJSON *retjson; uint32_t requestid,quoteid; int32_t i,nonz; struct LP_pendswap *sp,*tmp;
-    strcpy(LP_swapsloop_stats.name,"LP_swapsloop");
-    LP_swapsloop_stats.threshold = 605000.;
-    if ( (retstr= basilisk_swapentry(0,0,0,1)) != 0 )
-    {
-        if ( (retjson= cJSON_Parse(retstr)) != 0 )
-        {
-            if ( (requestid= juint(retjson,"requestid")) != 0 && (quoteid= juint(retjson,"quoteid")) != 0 && jobj(retjson,"error") == 0 )
-                LP_pendswap_add(0,requestid,quoteid);
-        }
-        free(retstr);
-    }
-    while ( LP_STOP_RECEIVED == 0 )
-    {
-        if ( G.initializing != 0 )
-        {
-            sleep(1);
-            continue;
-        }
-        LP_millistats_update(&LP_swapsloop_stats);
-        nonz = 0;
-        DL_FOREACH_SAFE(LP_pendingswaps,sp,tmp)
-        {
-            if ( sp->finished == 0 )
-            {
-                nonz++;
-                if ( (sp->finished= LP_swapwait(0,sp->requestid,sp->quoteid,-1,0)) != 0 )
-                {
-                }
-                sleep(3);
-            }
-        }
-        if ( nonz == 0 )
-        {
-            for (i=0; i<10; i++)
-            {
-                //fprintf(stderr,"check on alice expiration\n");
-                LP_alice_eligible((uint32_t)time(NULL));
-                sleep(6);
-            }
-        } else sleep(10);
-        LP_gtc_iteration(ctx,LP_myipaddr,LP_mypubsock);
-    }
-}
-
-void gc_loop(void *ctx)
-{
-    uint32_t now; struct LP_address_utxo *up,*utmp; struct rpcrequest_info *req,*rtmp; int32_t flag = 0;
-    strcpy(LP_gcloop_stats.name,"gc_loop");
-    LP_gcloop_stats.threshold = 11000.;
-    while ( LP_STOP_RECEIVED == 0 )
-    {
-        if ( G.initializing != 0 )
-        {
-            sleep(1);
-            continue;
-        }
-        flag = 0;
-        LP_millistats_update(&LP_gcloop_stats);
-        portable_mutex_lock(&LP_gcmutex);
-        DL_FOREACH_SAFE(LP_garbage_collector,req,rtmp)
-        {
-            DL_DELETE(LP_garbage_collector,req);
-            //printf("garbage collect ipbits.%x\n",req->ipbits);
-            free(req);
-            flag++;
-        }
-        now = (uint32_t)time(NULL);
-        DL_FOREACH_SAFE(LP_garbage_collector2,up,utmp)
-        {
-            if ( now > (uint32_t)up->spendheight+120 )
-            {
-                DL_DELETE(LP_garbage_collector2,up);
-                //char str[65]; printf("garbage collect %s/v%d lag.%d\n",bits256_str(str,up->U.txid),up->U.vout,now-up->spendheight);
-                free(up);
-            }
-            flag++;
-        }
-        portable_mutex_unlock(&LP_gcmutex);
-        if ( 0 && flag != 0 )
-            printf("gc_loop.%d\n",flag);
-        sleep(10);
-    }
-}
-
-void queue_loop(void *ctx)
-{
-    struct LP_queue *ptr,*tmp; cJSON *json; uint8_t linebuf[32768]; int32_t k,sentbytes,nonz,flag,duplicate,n=0;
-    strcpy(queue_loop_stats.name,"queue_loop");
-    queue_loop_stats.threshold = 1000.;
-    while ( LP_STOP_RECEIVED == 0 )
-    {
-        if ( G.initializing != 0 )
-        {
-            sleep(1);
-            continue;
-        }
-        LP_millistats_update(&queue_loop_stats);
-        n = nonz = flag = 0;
-        DL_FOREACH_SAFE(LP_Q,ptr,tmp)
-        {
-            n++;
-            flag = 0;
-            if ( ptr->sock >= 0 )
-            {
-                //printf("sock.%d len.%d notready.%d\n",ptr->sock,ptr->msglen,ptr->notready);
-                if ( ptr->notready == 0 || (LP_rand() % ptr->notready) == 0 )
-                {
-                    if ( LP_sockcheck(ptr->sock) > 0 )
-                    {
-                        //bits256 magic;
-                        //magic = LP_calc_magic(ptr->msg,(int32_t)(ptr->msglen - sizeof(bits256)));
-                        //memcpy(&ptr->msg[ptr->msglen - sizeof(bits256)],&magic,sizeof(magic));
-                        if ( 0 )
-                        {
-                            static FILE *fp;
-                            if ( fp == 0 )
-                                fp = fopen("packet.log","wb");
-                            if ( fp != 0 )
-                            {
-                                fprintf(fp,"%s\n",(char *)ptr->msg);
-                                fflush(fp);
-                            }
-                        }
-                        if ( (json= cJSON_Parse((char *)ptr->msg)) != 0 )
-                        {
-                            if ( ptr->msglen < sizeof(linebuf) )
-                            {
-                                if ( (k= MMJSON_encode(linebuf,(char *)ptr->msg)) > 0 )
-                                {
-                                    if ( (sentbytes= nn_send(ptr->sock,linebuf,k,0)) != k )
-                                        printf("%d LP_send mmjson sent %d instead of %d\n",n,sentbytes,k);
-                                    else
-                                    {
-                                        flag++;
-                                        ptr->sock = -1;
-                                    }
-                                }
-                                //printf("k.%d flag.%d SEND.(%s) sock.%d\n",k,flag,(char *)ptr->msg,ptr->sock);
-                            }
-                            free_json(json);
-                        }
-                        if ( flag == 0 )
-                        {
-                           // printf("non-encoded len.%d SEND.(%s) sock.%d\n",ptr->msglen,(char *)ptr->msg,ptr->sock);
-                            if ( (sentbytes= nn_send(ptr->sock,ptr->msg,ptr->msglen,0)) != ptr->msglen )
-                                printf("%d LP_send sent %d instead of %d\n",n,sentbytes,ptr->msglen);
-                            else
-                            {
-                                flag++;
-                                ptr->sock = -1;
-                            }
-                        }
-                        if ( ptr->peerind > 0 )
-                            ptr->starttime = (uint32_t)time(NULL);
-                    }
-                    else
-                    {
-                        if ( ptr->notready++ > 100 )
-                        {
-                            flag = 1;
-                            //printf("queue_loop sock.%d len.%d notready.%d, skip\n",ptr->sock,ptr->msglen,ptr->notready);
-                            ptr->sock = -1;
-                        }
-                    }
-                }
-            }
-            else if ( 0 && time(NULL) > ptr->starttime+13 )
-            {
-                LP_crc32find(&duplicate,-1,ptr->crc32);
-                if ( duplicate > 0 )
-                {
-                    LP_Qfound++;
-                    if ( (LP_Qfound % 100) == 0 )
-                        printf("found.%u Q.%d err.%d match.%d\n",ptr->crc32,LP_Qenqueued,LP_Qerrors,LP_Qfound);
-                    flag++;
-                }
-                else if ( 0 ) // too much beyond duplicate filter when network is busy
-                {
-                    printf("couldnt find.%u peerind.%d Q.%d err.%d match.%d\n",ptr->crc32,ptr->peerind,LP_Qenqueued,LP_Qerrors,LP_Qfound);
-                    ptr->peerind++;
-                    if ( (ptr->sock= LP_peerindsock(&ptr->peerind)) < 0 )
-                    {
-                        printf("%d no more peers to try at peerind.%d %p Q_LP.%p\n",n,ptr->peerind,ptr,LP_Q);
-                        flag++;
-                        LP_Qerrors++;
-                    }
-                }
-            }
-            if ( flag != 0 )
-            {
-                nonz++;
-                portable_mutex_lock(&LP_networkmutex);
-                DL_DELETE(LP_Q,ptr);
-                portable_mutex_unlock(&LP_networkmutex);
-                free(ptr);
-                ptr = 0;
-                break;
-            }
-        }
-        if ( nonz == 0 )
-        {
-            if ( IAMLP == 0 )
-                usleep(50000);
-            else usleep(10000);
-        }
-    }
-}
-
-void LP_reserved_msgs(void *ignore)
-{
-    bits256 zero; int32_t flag,nonz; struct nn_pollfd pfd;
-    memset(zero.bytes,0,sizeof(zero));
-    strcpy(LP_reserved_msgs_stats.name,"LP_reserved_msgs");
-    LP_reserved_msgs_stats.threshold = 1000.;
-    while ( LP_STOP_RECEIVED == 0 )
-    {
-        if ( G.initializing != 0 )
-        {
-            sleep(1);
-            continue;
-        }
-        nonz = 0;
-        LP_millistats_update(&LP_reserved_msgs_stats);
-        if ( num_Reserved_msgs[1] > 0 )
-        {
-            nonz++;
-            portable_mutex_lock(&LP_reservedmutex);
-            if ( num_Reserved_msgs[1] > 0 )
-            {
-                num_Reserved_msgs[1]--;
-                //printf("PRIORITY BROADCAST.(%s)\n",Reserved_msgs[1][num_Reserved_msgs[1]]);
-                LP_broadcast_message(LP_mypubsock,"","",zero,Reserved_msgs[1][num_Reserved_msgs[1]]);
-                Reserved_msgs[1][num_Reserved_msgs[1]] = 0;
-            }
-            portable_mutex_unlock(&LP_reservedmutex);
-        }
-        else if ( num_Reserved_msgs[0] > 0 )
-        {
-            nonz++;
-            flag = 0;
-            if ( flag == 0 && LP_mypubsock >= 0 )
-            {
-                memset(&pfd,0,sizeof(pfd));
-                pfd.fd = LP_mypubsock;
-                pfd.events = NN_POLLOUT;
-                if ( nn_poll(&pfd,1,1) == 1 )
-                    flag = 1;
-            } else flag = 1;
-            if ( flag == 1 )
-            {
-                portable_mutex_lock(&LP_reservedmutex);
-                num_Reserved_msgs[0]--;
-                //printf("BROADCAST.(%s)\n",Reserved_msgs[0][num_Reserved_msgs[0]]);
-                LP_broadcast_message(LP_mypubsock,"","",zero,Reserved_msgs[0][num_Reserved_msgs[0]]);
-                Reserved_msgs[0][num_Reserved_msgs[0]] = 0;
-                portable_mutex_unlock(&LP_reservedmutex);
-            }
-        }
-        if ( ignore == 0 )
-            break;
-        if ( nonz == 0 )
-            usleep(5000);
-    }
-}
 
 int32_t LP_reserved_msg(int32_t priority,char *base,char *rel,bits256 pubkey,char *msg)
 {
@@ -1439,7 +1161,7 @@ fn test_crc32() {
 }
 
 /// Invokes `OS_ensure_directory`,
-/// then prints an error and returns `false` if the directory is not writeable.
+/// then prints an error and returns `false` if the directory is not writable.
 fn ensure_dir_is_writable(dir_path: &Path) -> bool {
     let c_dir_path = unwrap! (dir_path.to_str());
     let c_dir_path = unwrap! (CString::new (c_dir_path));
@@ -1500,15 +1222,19 @@ fn fix_directories(ctx: &MmCtx) -> Result<(), String> {
     let dbdir = ctx.dbdir();
     try_s!(std::fs::create_dir_all(&dbdir));
     unsafe {os::OS_ensure_directory (lp::GLOBAL_DBDIR.as_ptr() as *mut c_char)};
-    if !ensure_dir_is_writable(&dbdir.join ("SWAPS")) {return ERR!("SWAPS db dir is not writeable")}
-    if !ensure_dir_is_writable(&dbdir.join ("SWAPS").join ("MY")) {return ERR!("SWAPS/MY db dir is not writeable")}
-    if !ensure_dir_is_writable(&dbdir.join ("SWAPS").join ("STATS")) {return ERR!("SWAPS/STATS db dir is not writeable")}
-    if !ensure_dir_is_writable(&dbdir.join ("SWAPS").join ("STATS").join ("MAKER")) {return ERR!("SWAPS/STATS/MAKER db dir is not writeable")}
-    if !ensure_dir_is_writable(&dbdir.join ("SWAPS").join ("STATS").join ("TAKER")) {return ERR!("SWAPS/STATS/TAKER db dir is not writeable")}
-    if !ensure_dir_is_writable(&dbdir.join ("TRANSACTIONS")) {return ERR!("TRANSACTIONS db dir is not writeable")}
-    if !ensure_dir_is_writable(&dbdir.join ("GTC")) {return ERR!("GTC db dir is not writeable")}
-    if !ensure_dir_is_writable(&dbdir.join ("PRICES")) {return ERR!("PRICES db dir is not writeable")}
-    if !ensure_dir_is_writable(&dbdir.join ("UNSPENTS")) {return ERR!("UNSPENTS db dir is not writeable")}
+    if !ensure_dir_is_writable(&dbdir.join ("SWAPS")) {return ERR!("SWAPS db dir is not writable")}
+    if !ensure_dir_is_writable(&dbdir.join ("SWAPS").join ("MY")) {return ERR!("SWAPS/MY db dir is not writable")}
+    if !ensure_dir_is_writable(&dbdir.join ("SWAPS").join ("STATS")) {return ERR!("SWAPS/STATS db dir is not writable")}
+    if !ensure_dir_is_writable(&dbdir.join ("SWAPS").join ("STATS").join ("MAKER")) {return ERR!("SWAPS/STATS/MAKER db dir is not writable")}
+    if !ensure_dir_is_writable(&dbdir.join ("SWAPS").join ("STATS").join ("TAKER")) {return ERR!("SWAPS/STATS/TAKER db dir is not writable")}
+    if !ensure_dir_is_writable(&dbdir.join ("TRANSACTIONS")) {return ERR!("TRANSACTIONS db dir is not writable")}
+    if !ensure_dir_is_writable(&dbdir.join ("GTC")) {return ERR!("GTC db dir is not writable")}
+    if !ensure_dir_is_writable(&dbdir.join ("PRICES")) {return ERR!("PRICES db dir is not writable")}
+    if !ensure_dir_is_writable(&dbdir.join ("UNSPENTS")) {return ERR!("UNSPENTS db dir is not writable")}
+    if !ensure_dir_is_writable(&dbdir.join ("ORDERS")) {return ERR!("ORDERS db dir is not writable")}
+    if !ensure_dir_is_writable(&dbdir.join ("ORDERS").join ("MY")) {return ERR!("ORDERS/MY db dir is not writable")}
+    if !ensure_dir_is_writable(&dbdir.join ("ORDERS").join ("MY").join ("MAKER")) {return ERR!("ORDERS/MY/MAKER db dir is not writable")}
+    if !ensure_dir_is_writable(&dbdir.join ("ORDERS").join ("MY").join ("TAKER")) {return ERR!("ORDERS/MY/TAKER db dir is not writable")}
     try_s!(ensure_file_is_writable(&dbdir.join ("GTC").join ("orders")));
     Ok(())
 }
@@ -1524,7 +1250,7 @@ fn fix_directories(ctx: &MmCtx) -> Result<(), String> {
 ///     in order to avoid the possibility of invalid state.
 /// AP: Totally agree, moreover maybe we even `must` deny calling this on a working MM as it's being refactored
 #[allow(unused_unsafe)]
-pub unsafe fn lp_passphrase_init (passphrase: Option<&str>, gui: Option<&str>) -> Result<H160, String> {
+pub unsafe fn lp_passphrase_init (passphrase: Option<&str>, gui: Option<&str>) -> Result<KeyPair, String> {
     let passphrase = match passphrase {
         None | Some ("") => return ERR! ("jeezy says we cant use the nullstring as passphrase and I agree"),
         Some (s) => s.to_string()
@@ -1571,7 +1297,7 @@ pub unsafe fn lp_passphrase_init (passphrase: Option<&str>, gui: Option<&str>) -
     lp::G.USERPASS_COUNTER = userpass_counter;
 
     lp::G.initializing = 0;
-    Ok(rmd_160)
+    Ok(global_key_pair)
 }
 
 /// Tries to serve on the given IP to check if it's available.  
@@ -1640,7 +1366,7 @@ fn test_ip (ctx: &MmArc, ip: IpAddr) -> Result<(Sender<()>, u16), String> {
     Ok ((shutdown_tx, port))
 }
 
-pub fn lp_init (mypullport: u16, mypubport: u16, conf: Json, c_conf: CJSON, ctx_cb: &Fn (u32))
+pub fn lp_init (mypubport: u16, conf: Json, ctx_cb: &dyn Fn (u32))
 -> Result<(), String> {
     unsafe {lp::G.initializing = 1}  // Tells some of the spawned threads to wait till the `lp_passphrase_init` is done.
     BITCOIND_RPC_INITIALIZING.store (true, Ordering::Relaxed);
@@ -1682,9 +1408,8 @@ pub fn lp_init (mypullport: u16, mypubport: u16, conf: Json, c_conf: CJSON, ctx_
         }
     }
     unsafe {lp::LP_mutex_init()};
-    let rmd_160 = unsafe {try_s! (lp_passphrase_init (conf["passphrase"].as_str(), conf["gui"].as_str()))};
-
-    let ctx = MmCtx::new (conf, rmd_160);
+    let key_pair = unsafe {try_s! (lp_passphrase_init (conf["passphrase"].as_str(), conf["gui"].as_str()))};
+    let ctx = MmCtxBuilder::new().with_conf(conf).with_secp256k1_key_pair(key_pair).into_mm_arc();
     let global: &mut [c_char] = unsafe {&mut lp::GLOBAL_DBDIR[..]};
     let global: &mut [u8] = unsafe {transmute (global)};
     let mut cur = Cursor::new (global);
@@ -1703,8 +1428,8 @@ pub fn lp_init (mypullport: u16, mypubport: u16, conf: Json, c_conf: CJSON, ctx_
     let i_am_seed = ctx.conf["i_am_seed"].as_bool().unwrap_or(false);
     let netid = ctx.netid();
 
-    let mut http_fallback_shutdown = None;
-    let mut http_fallback_port = None;
+    // Keeps HTTP fallback server alive until `lp_init` exits.
+    let mut _hf_shutdown;
 
     let myipaddr: IpAddr = if Path::new ("myipaddr") .exists() {
         match fs::File::open ("myipaddr") {
@@ -1768,16 +1493,13 @@ pub fn lp_init (mypullport: u16, mypubport: u16, conf: Json, c_conf: CJSON, ctx_
             // Try to bind on this IP.
             // If we're not behind a NAT then the bind will likely suceed.
             // If the bind fails then emit a user-visible warning and fall back to 0.0.0.0.
-            let tags: &[&TagParam] = &[&"myipaddr"];
+            let tags: &[&dyn TagParam] = &[&"myipaddr"];
             match test_ip (&ctx, ip) {
-                Ok ((hf_shutdown, hf_port)) => {
+                Ok ((hf_shutdown, _hf_port)) => {
                     ctx.log.log ("🙂", tags, &fomat! (
                         "We've detected an external IP " (ip) " and we can bind on it (port " (mypubport) ")"
                         ", so probably a dedicated IP."));
-                    if i_am_seed {
-                        http_fallback_shutdown = Some (hf_shutdown);
-                        http_fallback_port = Some (hf_port);
-                    }
+                    if i_am_seed {_hf_shutdown = hf_shutdown}
                     break ip
                 },
                 Err (err) => log! ("IP " (ip) " doesn't check: " (err))
@@ -1823,69 +1545,27 @@ pub fn lp_init (mypullport: u16, mypubport: u16, conf: Json, c_conf: CJSON, ctx_
 
     let seednodes: Option<Vec<String>> = try_s!(json::from_value(ctx.conf["seednodes"].clone()));
     unsafe { try_s! (lp_initpeers (&ctx, lp::LP_mypubsock, lp::LP_mypeer, &myipaddr, lp::RPC_port, netid, seednodes)); }
-    /*
-    #ifndef FROM_JS
-        if ( OS_thread_create(malloc(sizeof(pthread_t)),NULL,(void *)LP_psockloop,(void *)myipaddr) != 0 )
-        {
-            printf("error launching LP_psockloop for (%s)\n",myipaddr);
-            exit(-1);
-        }
-        if ( OS_thread_create(malloc(sizeof(pthread_t)),NULL,(void *)LP_reserved_msgs,(void *)myipaddr) != 0 )
-        {
-            printf("error launching LP_reserved_msgs for (%s)\n",myipaddr);
-            exit(-1);
-        }
-        if ( OS_thread_create(malloc(sizeof(pthread_t)),NULL,(void *)stats_rpcloop,(void *)&myport) != 0 )
-        {
-            printf("error launching stats rpcloop for port.%u\n",myport);
-            exit(-1);
-        }
-        if ( OS_thread_create(malloc(sizeof(pthread_t)),NULL,(void *)command_rpcloop,ctx) != 0 )
-        {
-            printf("error launching command_rpcloop for ctx.%p\n",ctx);
-            exit(-1);
-        }
-        if ( OS_thread_create(malloc(sizeof(pthread_t)),NULL,(void *)queue_loop,ctx) != 0 )
-        {
-            printf("error launching queue_loop for ctx.%p\n",ctx);
-            exit(-1);
-        }
-        if ( OS_thread_create(malloc(sizeof(pthread_t)),NULL,(void *)gc_loop,ctx) != 0 )
-        {
-            printf("error launching gc_loop for port.%p\n",ctx);
-            exit(-1);
-        }
-        */
     ctx.initialized.store (true, Ordering::Relaxed);
     let prices = try_s! (thread::Builder::new().name ("prices".into()) .spawn ({
         let ctx = ctx.clone();
         move || prices_loop (ctx)
     }));
     /*
-    if ( OS_thread_create(malloc(sizeof(pthread_t)),NULL,(void *)LP_coinsloop,(void *)"") != 0 )
-    {
-        printf("error launching LP_coinsloop for (%s)\n","");
-        exit(-1);
-    }
-    if ( OS_thread_create(malloc(sizeof(pthread_t)),NULL,(void *)LP_coinsloop,(void *)"BTC") != 0 )
-    {
-        printf("error launching LP_coinsloop for (%s)\n","BTC");
-        exit(-1);
-    }
-    if ( OS_thread_create(malloc(sizeof(pthread_t)),NULL,(void *)LP_coinsloop,(void *)"KMD") != 0 )
-    {
-        printf("error launching LP_coinsloop for (%s)\n","KMD");
-        exit(-1);
-    }
     if ( OS_thread_create(malloc(sizeof(pthread_t)),NULL,(void *)LP_pubkeysloop,ctx) != 0 )
     {
         printf("error launching LP_pubkeysloop for ctx.%p\n",ctx);
         exit(-1);
     }
 */
+    // launch kickstart threads before RPC is available, this will prevent the API user to place
+    // an order and start new swap that might get started 2 times because of kick-start
+    let mut coins_needed_for_kick_start = swap_kick_starts (ctx.clone());
+    coins_needed_for_kick_start.extend(try_s!(orders_kick_start(&ctx)));
+    *(try_s!(ctx.coins_needed_for_kick_start.lock())) = coins_needed_for_kick_start;
+
     let trades = try_s! (thread::Builder::new().name ("trades".into()) .spawn ({
         let ctx = ctx.clone();
-        move || unsafe { lp_trades_loop (ctx) }
+        move || lp_trades_loop (ctx)
     }));
 
     let command_queue = try_s! (thread::Builder::new().name ("command_queue".into()) .spawn ({
@@ -1893,11 +1573,6 @@ pub fn lp_init (mypullport: u16, mypubport: u16, conf: Json, c_conf: CJSON, ctx_
         move || unsafe { lp_command_q_loop (ctx) }
     }));
 /*
-    if ( OS_thread_create(malloc(sizeof(pthread_t)),NULL,(void *)LP_swapsloop,ctx) != 0 )
-    {
-        printf("error launching LP_swapsloop for ctx.%p\n",ctx);
-        exit(-1);
-    }
     int32_t nonz,didremote=0;
     LP_statslog_parse();
     bitcoind_RPC_inittime = 0;
@@ -1939,7 +1614,6 @@ pub fn lp_init (mypullport: u16, mypubport: u16, conf: Json, c_conf: CJSON, ctx_
     sleep(5);
     exit(0);
 */
-    let passphrase = try_s! (CString::new (unwrap! (ctx.conf["passphrase"].as_str())));
     let ctx_id = try_s! (ctx.ffi_handle());
 
     // `LPinit` currently fails to stop in a timely manner, so we're dropping the `lp_init` context early
@@ -1953,8 +1627,7 @@ pub fn lp_init (mypullport: u16, mypubport: u16, conf: Json, c_conf: CJSON, ctx_
     unsafe {lp::SPAWN_RPC = Some (rpc::spawn_rpc)};
     unsafe {lp::LP_QUEUE_COMMAND = Some (lp_queue_command_for_c)};
 
-    let myipaddr = unsafe {lp::LP_myipaddr.as_ptr() as *mut c_char};
-    unsafe {lp::LPinit (myipaddr, mypullport, mypubport, passphrase.as_ptr() as *mut c_char, c_conf.0, ctx_id)};
+    unsafe {lp::LPinit (ctx_id)};
     unwrap! (prices.join());
     unwrap! (trades.join());
     unwrap! (command_queue.join());

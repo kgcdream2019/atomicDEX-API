@@ -19,27 +19,52 @@
 //
 
 use bitcrypto::ripemd160;
-use common::{free_c_ptr, HyRes, CJSON, CORE, QueuedCommand, COMMAND_QUEUE, lp_queue_command};
+use common::{free_c_ptr, lp_queue_command, HyRes, QueuedCommand, CJSON, COMMAND_QUEUE};
+use common::wio::CORE;
 use common::mm_ctx::MmArc;
 use crossbeam::channel;
-use futures::{future, Future, Stream};
+use futures::{future, Future};
+use gstuff::now_ms;
 use hashbrown::hash_map::{HashMap, Entry};
 use libc::{c_void};
 use primitives::hash::H160;
 use serde_json::{self as json, Value as Json};
 use std::ffi::{CStr};
-use std::fmt;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
 use crate::mm2::lp_native_dex::lp_command_process;
+use crate::mm2::lp_ordermatch::lp_post_price_recv;
 use crate::mm2::lp_swap::save_stats_swap_status;
-use crate::mm2::rpc::{dispatcher, DispatcherRes};
-use gstuff::now_ms;
+use crate::mm2::rpc::lp_signatures::lp_notify_recv;
 
-pub fn nanomsg_transportname (bindflag: i32, ipaddr: &fmt::Display, port: u16) -> String {
-    fomat! ("tcp://" if bindflag == 0 {(ipaddr)} else {"*"} ':' (port))
+/// Result of `fn dispatcher`.
+pub enum DispatcherRes {
+    /// `fn dispatcher` has found a Rust handler for the RPC "method".
+    Match (HyRes),
+    /// No handler found by `fn dispatcher`. Returning the `Json` request in order for it to be handled elsewhere.
+    NoMatch (Json)
+}
+
+/// The network module dispatcher, handles the messages received from other nodes
+fn dispatcher (req: Json, ctx: MmArc) -> DispatcherRes {
+    // AP: the HTTP RPC server dispatcher was previously used for this purpose which IMHO
+    // breaks single responsibility principe, makes harder to maintain the codebase and possibly
+    // adds security concerns. Also we might end with using different serialization formats (binary)
+    // for P2P messages - JSON is excessive for such purpose while it's completely fine to use it for HTTP server.
+    // See https://github.com/artemii235/SuperNET/issues/415 for more info
+    // So this is a starting point of further refactoring
+    //log! ("dispatcher] " (json::to_string (&req) .unwrap()));
+    let method = match req["method"].clone() {
+        Json::String (method) => method,
+        _ => return DispatcherRes::NoMatch (req)
+    };
+    DispatcherRes::Match (match &method[..] {  // Sorted alphanumerically (on the first latter) for readability.
+        "notify" => lp_notify_recv (ctx, req),  // Invoked usually from the `lp_command_q_loop`
+        "postprice" => lp_post_price_recv (&ctx, req),
+        _ => return DispatcherRes::NoMatch (req)
+    })
 }
 
 #[derive(Serialize)]
@@ -70,23 +95,17 @@ fn reply_to_peer (cmd: QueuedCommand, mut reply: Vec<u8>) -> Result<(), String> 
 
 /// Run the RPC handler and send it's reply to a peer.
 fn rpc_reply_to_peer (handler: HyRes, cmd: QueuedCommand) {
-    let f = handler.then (move |r| -> Box<Future<Item=(), Error=()> + Send> {
+    let f = handler.then (move |r| -> Box<dyn Future<Item=(), Error=()> + Send> {
         let res = match r {Ok (r) => r, Err (err) => {
             log! ("rpc_reply_to_peer] handler error: " (err));
             return Box::new (future::err(()))
         }};
-        let body_f = res.into_body().concat2();
-        Box::new (body_f.then (move |body| -> Result<(), ()> {
-            let body = match body {Ok (r) => r, Err (err) => {
-                log! ("rpc_reply_to_peer] error getting the body from the RPC handler: " (err));
-                return Err(())
-            }};
-            if let Err (err) = reply_to_peer (cmd, body.to_vec()) {
-                log! ("reply_to_peer error: " (err));
-                return Err(())
-            }
-            Ok(())
-        }))
+        let body = res.into_body();
+        if let Err (err) = reply_to_peer (cmd, body) {
+            log! ("reply_to_peer error: " (err));
+            return Box::new (future::err(()))
+        }
+        Box::new (future::ok(()))
     });
     CORE.spawn (|_| f)
 }
@@ -137,7 +156,7 @@ pub unsafe fn lp_command_q_loop(ctx: MmArc) {
             ctx.broadcast_p2p_msg(&cmd.msg);
         }
 
-        let json = match dispatcher(json, None, ctx.clone()) {
+        let json = match dispatcher(json, ctx.clone()) {
             DispatcherRes::Match(handler) => {
                 rpc_reply_to_peer(handler, cmd);
                 continue
@@ -243,7 +262,7 @@ pub fn client_p2p_loop(ctx: MmArc, addrs: Vec<String>) {
             for (addr, last_attempt) in addrs.iter_mut() {
                 let is_connected = seed_connections.iter().find(|conn| &conn.addr == addr);
                 if is_connected.is_none() && *last_attempt + 30000 < now_ms() {
-                    ctx.log.log("😀", &[&"seed_connection", &addr.as_str()], "Connecting...");
+                    ctx.log.log("…", &[&"seed_connection", &addr.as_str()], "Connecting…");
                     *last_attempt = now_ms();
                     match TcpStream::connect(&*addr) {
                         Ok(stream) => {
@@ -254,7 +273,7 @@ pub fn client_p2p_loop(ctx: MmArc, addrs: Vec<String>) {
                                         addr: addr.to_string(),
                                         buf: String::new(),
                                     };
-                                    ctx.log.log("😀", &[&"seed_connection", &addr.as_str()], "Connected...");
+                                    ctx.log.log("⚡", &[&"seed_connection", &addr.as_str()], "Connected");
                                     seed_connections.push(conn);
                                 },
                                 Err(e) => ctx.log.log("😟", &[&"seed_connection", &addr.as_str()], &format!("Error {} setting non-blocking mode", e)),

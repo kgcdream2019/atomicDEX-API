@@ -17,7 +17,8 @@
 //  rpc_commands.rs
 //  marketmaker
 //
-use common::{bitcoin_address, bits256, coins_iter, lp, rpc_response, rpc_err_response, HyRes, CORE, MM_VERSION};
+use common::{bitcoin_address, bits256, coins_iter, lp, rpc_response, rpc_err_response, HyRes, MM_VERSION};
+use common::wio::CORE;
 use common::mm_ctx::MmArc;
 use coins::lp_coinfind;
 use futures::Future;
@@ -28,7 +29,7 @@ use libc::{c_void, free};
 use serde_json::{self as json, Value as Json};
 use std::ffi::{CStr};
 use std::mem::zeroed;
-use std::ptr::null_mut;
+use std::ptr::{null_mut, write_volatile};
 use std::time::Duration;
 
 use crate::mm2::lp_native_dex::lp_passphrase_init;
@@ -326,7 +327,7 @@ pub fn stop (ctx: MmArc) -> HyRes {
     let pause_f = Delay::new (Duration::from_millis (50));
     let stop_f = pause_f.then (move |r| -> Result<(), ()> {
         if let Err (err) = r {log! ("stop] Warning, there was a Delay error: " (err))}
-        unsafe {lp::LP_STOP_RECEIVED = 1};
+        unsafe {write_volatile (&mut lp::LP_STOP_RECEIVED, 1)}
         ctx.stop();
         Ok(())
     });
@@ -772,8 +773,6 @@ pub fn inventory (ctx: MmArc, req: Json) -> HyRes {
     }
     else if ( strcmp(method,"postprice") == 0 )
         return(LP_postprice_recv(argjson));
-    else if ( strcmp(method,"uitem") == 0 )
-        return(LP_uitem_recv(argjson));
     else if ( strcmp(method,"dPoW") == 0 )
         return(LP_dPoW_recv(argjson));
     else if ( strcmp(method,"getpeers") == 0 )
